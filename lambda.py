@@ -38,7 +38,7 @@ def chunks(xs, n):
 parser = ConfigParser()
 parser.read(environ["LAMBDA_TASK_ROOT"] + "/config.ini")
 config = parser["default"]
-BUCKET_NAME = config.pop("bucket")
+BUCKET = boto3.resource("s3").Bucket(config.pop("bucket"))
 
 DYNAMODB = boto3.resource("dynamodb")
 TABLE_NAMES = dotdict(**config)
@@ -50,9 +50,13 @@ TABLES = dotdict(
 
 
 class Blob:
-    def __init__(self, bucket, digest):
+    def __init__(self, digest):
         self._digest = digest
-        self._s3 = bucket.Object("blobs/" + digest)
+        self._s3 = BUCKET.Object("blobs/" + digest)
+
+    def delete(self):
+        self._s3.delete()
+        TABLES.blobs.delete_item(Key=dict(digest=self._digest))
 
     def _exists_in_s3(self):
         try:
@@ -63,7 +67,7 @@ class Blob:
             # inaccessible
             return False
 
-        TABLES.blobs.put_item(Key=dict(digest=self._digest))
+        TABLES.blobs.put_item(Item=dict(digest=self._digest))
         return True
 
     @classmethod
@@ -71,7 +75,12 @@ class Blob:
         ret = []
         for chunk in chunks(digests, 100):
             resp = DYNAMODB.batch_get_item(
-                RequestItems={TABLE_NAMES.blobs: [dict(digest=d) for d in digests]}
+                RequestItems={
+                    TABLE_NAMES.blobs: dict(
+                        Keys=[dict(digest=d) for d in digests],
+                        ProjectionExpression="digest",
+                    )
+                }
             )
 
             ret.extend(row["digest"] for row in resp["Responses"][TABLE_NAMES.blobs])
@@ -79,12 +88,12 @@ class Blob:
         return ret
 
     @classmethod
-    def batch_exists(cls, bucket, digests):
+    def batch_exists(cls, digests):
         exists = set(cls._batch_fetch_dynamodb(digests))
         missing = set(digests) - exists
 
         for digest in missing:
-            if cls(bucket, digest)._exists_in_s3():
+            if cls(digest)._exists_in_s3():
                 exists.add(digest)
 
         return exists
@@ -105,7 +114,7 @@ class Indexers:
             digests.append(layer["digest"])
 
         exists_set = Blob.batch_exists(digests)
-        items = [dict(digest=d, source=name, found=(d in exists_set)) for d in digests]
+        items = [dict(digest=d, source=name) for d in digests]
 
         # Write in_refs, then out_refs
         # The happens-before relationship is why we don't use a GSI
@@ -117,7 +126,7 @@ class Indexers:
 
         with TABLES.references.batch_writer() as batch:
             for item in items:
-                batch.put_item(item)
+                batch.put_item(dict(found=item["digest"] in exists_set, **item))
 
         return digests
 
@@ -182,7 +191,7 @@ class ManifestHandlers:
         )
 
     @staticmethod
-    def _gc_ref(bucket, digest, image_name):
+    def _gc_ref(digest, image_name):
         """Garbage-collects a single reference to a blob, deleting the blob if its
         refcount hits zero."""
 
@@ -193,14 +202,12 @@ class ManifestHandlers:
         )
         if resp["Count"] == 0:
             # The object is now unreferenced
-            deletable = bucket.Object("blobs/" + digest)
-            print(deletable)
-            # deletable.delete()
+            Blob(digest).delete()
 
         TABLES.references.delete_item(Key=dict(source=image_name, digest=digest))
 
     @classmethod
-    def _perform_gc(cls, bucket, image_name):
+    def _perform_gc(cls, image_name):
         """Garbage collects all of the outbound references of a single manifest."""
 
         while True:
@@ -212,7 +219,7 @@ class ManifestHandlers:
                 break
 
             for item in resp["Items"]:
-                cls._gc_ref(bucket, item["digest"], image_name)
+                cls._gc_ref(item["digest"], image_name)
 
     @classmethod
     def _handle_manifest_deleted(cls, s3_object, image_name):
@@ -221,8 +228,7 @@ class ManifestHandlers:
         resp = TABLES.manifests.get_item(Key=dict(name=image_name))
         item = resp.get("Item")
         if item:
-            bucket = s3_object.Object().Bucket()
-            cls._perform_gc(bucket, image_name)
+            cls._perform_gc(image_name)
 
         # If this fails, a create happened during this delete
         cls._put_expires(image_name, already_exists=bool(item))
@@ -257,6 +263,10 @@ def handle_record(r):
 
     s3_info = r["s3"]
     bucket = s3_info["bucket"]["name"]
+    if bucket != BUCKET.name:
+        # We got sent a notification for the wrong bucket!?
+        return
+
     object_info = s3_info["object"]
     key = unquote_plus(object_info["key"], encoding="utf-8")
     image_name = trim_start(key, "manifests/")

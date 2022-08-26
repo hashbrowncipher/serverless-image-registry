@@ -195,7 +195,7 @@ def lambda_iam_role(identifier, stmts):
     )
 
 
-def registry_iam_role(bucket_name):
+def registry_iam_role(bucket_arn):
     return lambda_iam_role(
         "registry_s3_events",
         stmts=[
@@ -203,13 +203,14 @@ def registry_iam_role(bucket_name):
                 Effect="Allow",
                 Action=[
                     "s3:GetObject",
+                    "s3:GetObjectVersion",
                     "s3:DeleteObject",
                     "s3:PutObjectVersionTagging",
                     "s3:ListBucket",
                 ],
                 Resource=[
-                    f"arn:aws:s3:::{bucket_name}",
-                    f"arn:aws:s3:::{bucket_name}/*",
+                    bucket_arn,
+                    bucket_arn + "/*",
                 ],
             ),
             dict(
@@ -217,8 +218,10 @@ def registry_iam_role(bucket_name):
                 Action=[
                     "dynamodb:BatchGetItem",
                     "dynamodb:BatchWriteItem",
+                    "dynamodb:DeleteItem",
                     "dynamodb:GetItem",
                     "dynamodb:PutItem",
+                    "dynamodb:Query",
                 ],
                 Resource=[
                     f"arn:aws:dynamodb:{region}:{account_id}:table/registry_*",
@@ -228,7 +231,7 @@ def registry_iam_role(bucket_name):
     )
 
 
-role = registry_iam_role(bucket.bucket)
+role = bucket.arn.apply(registry_iam_role)
 
 
 def s3_lambda():
@@ -279,15 +282,29 @@ def s3_lambda():
     )
 
 
-def registry_server(bucket_arn):
+def _s3_bucket_arn(name):
+    return "arn:aws:s3:::" + name
+
+
+def registry_server(config):
     identifier = "registry_server"
+    bucket_name = config["bucket"]
+    config["debug"] = "true"
+
+    archive = pulumi.AssetArchive(
+        {
+            "config.ini": _make_config_ini(config),
+            "lambda_function.py": pulumi.FileAsset("../app.py"),
+        }
+    )
+
     role = lambda_iam_role(
         identifier,
         [
             dict(
                 Effect="Allow",
                 Action="s3:GetObject",
-                Resource=[bucket_arn + "/*"],
+                Resource=[_s3_bucket_arn(bucket_name) + "/*"],
             ),
             dict(
                 Effect="Allow",
@@ -295,12 +312,6 @@ def registry_server(bucket_arn):
                 Resource=f"arn:aws:dynamodb:{region}:{account_id}:table/registry_*",
             ),
         ],
-    )
-
-    archive = pulumi.AssetArchive(
-        {
-            "lambda_function.py": pulumi.FileAsset("../app.py"),
-        }
     )
 
     function = lambda_.Function(
@@ -318,4 +329,4 @@ def registry_server(bucket_arn):
 
 
 s3_lambda()
-bucket.arn.apply(registry_server)
+Output.all(bucket=bucket.id, manifests=TABLE_NAMES["manifests"]).apply(registry_server)

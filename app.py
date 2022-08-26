@@ -16,7 +16,7 @@ BUCKET_NAME = config["bucket"]
 
 MATCHER = re.compile("v2/(.*)/(manifests|blobs)/([^/]+)$")
 
-MANIFESTS_TABLE = boto3.resource("dynamodb").Table("registry_manifests-20344e1")
+MANIFESTS_TABLE = boto3.resource("dynamodb").Table(config["manifests"])
 
 
 def _get_actual_manifest(repository, image):
@@ -40,6 +40,9 @@ def _get_actual_manifest(repository, image):
 def make_response(status, *, headers=None, body=b"", content_type=None):
     if headers is None:
         headers = dict()
+
+    if content_type is not None:
+        headers.setdefault("Content-Type", content_type)
 
     if not isinstance(body, (str, bytes)):
         body = json.dumps(body)
@@ -96,13 +99,11 @@ class App:
 
 
 def lambda_handler(event, context):
-    return make_response(200, body="Hi")
-
     try:
         return App(
             event["requestContext"]["http"]["method"],
             event["requestContext"]["http"]["path"],
         ).route()
     except Exception:
-        print(format_exc())
-        return make_response(500, body=format_exc())
+        body = format_exc() if config["debug"] == "true" else "Internal Server Error"
+        return make_response(500, body=body)
